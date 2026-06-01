@@ -79,6 +79,20 @@ const TARGET_MODELS = (
   'deepseek'
 ).split(',').map(s => s.trim()).filter(Boolean);
 
+// Static model rewrite rules — env SHIM_MODEL_REWRITE_RULES.
+// Format: "from1:to1,from2:to2"
+// Applied BEFORE alias map lookup. Useful for overriding CC's hardcoded
+// internal model names (e.g. claude-sonnet-4-6 used by compaction).
+// Example: SHIM_MODEL_REWRITE_RULES=claude-sonnet-4-6:claude-sonnet-4-6-cc
+const staticRewriteMap = new Map(
+  (process.env.SHIM_MODEL_REWRITE_RULES || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.includes(':'))
+    .map(s => { const i = s.indexOf(':'); return [s.slice(0, i).trim(), s.slice(i + 1).trim()]; })
+    .filter(([k, v]) => k && v && k !== v)
+);
+
 // label (body.model from CC) → real model name (from _MODEL_NAME).
 // Rebuilt from settings.json on every watcher tick and on startup.
 let aliasMap = new Map();
@@ -101,11 +115,11 @@ function isDeepseek(model) {
   return false;
 }
 
-// Look up the real model name. If the label is in the alias map, return
-// the mapped value; otherwise return the input (so direct deepseek-* names
-// pass through unchanged).
+// Look up the real model name.
+// Priority: staticRewriteMap (env) > aliasMap (settings.json) > identity.
 function resolveRealModel(labelFromBody) {
   if (!labelFromBody) return labelFromBody;
+  if (staticRewriteMap.has(labelFromBody)) return staticRewriteMap.get(labelFromBody);
   if (aliasMap.has(labelFromBody)) return aliasMap.get(labelFromBody);
   return labelFromBody;
 }
@@ -223,35 +237,9 @@ function rewriteJsonThinkingSignatures(obj) {
   return changed;
 }
 
-function rewriteSseDataLine(line, targetIsDeepseek) {
-  if (!targetIsDeepseek || !line.startsWith('data: ')) return line;
-  const raw = line.slice(6);
-  if (!raw || raw === '[DONE]') return line;
-  let obj;
-  try { obj = JSON.parse(raw); } catch (_) { return line; }
-
-  let changed = false;
-
-  // content_block_start with a thinking block
-  if (obj && obj.type === 'content_block_start' && obj.content_block && obj.content_block.type === 'thinking') {
-    if (typeof obj.content_block.signature === 'string' && obj.content_block.signature !== '') {
-      obj.content_block.signature = '';
-      changed = true;
-    }
-  }
-
-  // Defensive: some providers may emit thinking blocks in message_delta-like payloads.
-  if (obj && obj.delta && obj.delta.type === 'thinking' && typeof obj.delta.signature === 'string' && obj.delta.signature !== '') {
-    obj.delta.signature = '';
-    changed = true;
-  }
-
-  if (!changed) return line;
-  return 'data: ' + JSON.stringify(obj);
-}
-
 function createSseRewriter(targetIsDeepseek) {
   let buffer = '';
+  let totalRewritten = 0;
   return {
     push(chunk) {
       buffer += chunk.toString('utf8');
@@ -260,18 +248,46 @@ function createSseRewriter(targetIsDeepseek) {
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const eventBlock = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 2);
-        const lines = eventBlock.split('\n').map(line => rewriteSseDataLine(line, targetIsDeepseek));
-        out.push(lines.join('\n') + '\n\n');
+        const parts = eventBlock.split('\n').map(line => rewriteSseDataLine(line, targetIsDeepseek));
+        totalRewritten += parts.reduce((s, r) => s + r.changed, 0);
+        out.push(parts.map(r => r.line).join('\n') + '\n\n');
       }
       return out;
     },
     flush() {
       if (!buffer) return '';
-      const lines = buffer.split('\n').map(line => rewriteSseDataLine(line, targetIsDeepseek));
+      const parts = buffer.split('\n').map(line => rewriteSseDataLine(line, targetIsDeepseek));
+      totalRewritten += parts.reduce((s, r) => s + r.changed, 0);
       buffer = '';
-      return lines.join('\n');
-    }
+      return parts.map(r => r.line).join('\n');
+    },
+    getRewritten() { return totalRewritten; }
   };
+}
+
+function rewriteSseDataLine(line, targetIsDeepseek) {
+  if (!targetIsDeepseek || !line.startsWith('data: ')) return { line, changed: 0 };
+  const raw = line.slice(6);
+  if (!raw || raw === '[DONE]') return { line, changed: 0 };
+  let obj;
+  try { obj = JSON.parse(raw); } catch (_) { return { line, changed: 0 }; }
+
+  let changed = 0;
+
+  if (obj && obj.type === 'content_block_start' && obj.content_block && obj.content_block.type === 'thinking') {
+    if (typeof obj.content_block.signature === 'string' && obj.content_block.signature !== '') {
+      obj.content_block.signature = '';
+      changed++;
+    }
+  }
+
+  if (obj && obj.delta && obj.delta.type === 'thinking' && typeof obj.delta.signature === 'string' && obj.delta.signature !== '') {
+    obj.delta.signature = '';
+    changed++;
+  }
+
+  if (!changed) return { line, changed: 0 };
+  return { line: 'data: ' + JSON.stringify(obj), changed };
 }
 
 // L2: crash guard — catch unhandled errors, log them, then exit so watchdog restarts.
@@ -584,6 +600,11 @@ const server = http.createServer((req, res) => {
         upRes.on('end', () => {
           const tail = rewriter.flush();
           if (tail) res.write(tail, 'utf8');
+          const n = rewriter.getRewritten();
+          if (n > 0) {
+            stats.sseRewritten += n;
+            log(`RESPONSE: cleared ${n} thinking signature(s) [stream]`);
+          }
           res.end();
         });
         upRes.on('error', err => {
@@ -638,5 +659,9 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   log(`deepseek-think-fix listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
   log(`  upstream:  ${CURRENT_UPSTREAM}  (${UP_IS_TLS ? 'HTTPS' : 'HTTP'})`);
   log(`  targets:   ${TARGET_MODELS.join(', ')}`);
+  if (staticRewriteMap.size > 0) {
+    const rules = [...staticRewriteMap].map(([k, v]) => `${k}->${v}`).join(', ');
+    log(`  rewrite:   ${rules}`);
+  }
   startSettingsWatcher();
 });
