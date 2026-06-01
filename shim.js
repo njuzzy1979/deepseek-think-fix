@@ -138,6 +138,10 @@ function buildAliasMapFromSettings(settings) {
     if (key === 'ANTHROPIC_REASONING_MODEL') {
       addPair(env[key], env['ANTHROPIC_REASONING_MODEL_NAME'] || '');
     }
+    // ANTHROPIC_MODEL → ANTHROPIC_MODEL_NAME
+    if (key === 'ANTHROPIC_MODEL') {
+      addPair(env[key], env['ANTHROPIC_MODEL_NAME'] || '');
+    }
   }
   return next;
 }
@@ -146,7 +150,11 @@ const LOG_FILE  = process.env.SHIM_LOG || path.join(__dirname, 'shim.log');
 const START_TIME = Date.now();
 
 // Runtime counters — exposed via /health.
-const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0 };
+const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0, sseRewritten: 0 };
+
+// Candidate third-party models discovered from settings.json. Observability only
+// for now — does not change injection behavior automatically.
+const candidateTargets = new Set();
 const VERBOSE  = process.env.SHIM_VERBOSE === '1';
 const DUMP     = process.env.SHIM_DUMP === '1';
 
@@ -198,6 +206,72 @@ function fixThinkingRoundtrip(body) {
     injected++;
   }
   return injected;
+}
+
+// Streaming response-side fix: normalize non-Anthropic thinking signatures so
+// Claude Code keeps the thinking block instead of dropping it on the next turn.
+function rewriteJsonThinkingSignatures(obj) {
+  let changed = 0;
+  if (!obj || !Array.isArray(obj.content)) return changed;
+  for (const block of obj.content) {
+    if (!block || block.type !== 'thinking') continue;
+    if (typeof block.signature === 'string' && block.signature !== '') {
+      block.signature = '';
+      changed++;
+    }
+  }
+  return changed;
+}
+
+function rewriteSseDataLine(line, targetIsDeepseek) {
+  if (!targetIsDeepseek || !line.startsWith('data: ')) return line;
+  const raw = line.slice(6);
+  if (!raw || raw === '[DONE]') return line;
+  let obj;
+  try { obj = JSON.parse(raw); } catch (_) { return line; }
+
+  let changed = false;
+
+  // content_block_start with a thinking block
+  if (obj && obj.type === 'content_block_start' && obj.content_block && obj.content_block.type === 'thinking') {
+    if (typeof obj.content_block.signature === 'string' && obj.content_block.signature !== '') {
+      obj.content_block.signature = '';
+      changed = true;
+    }
+  }
+
+  // Defensive: some providers may emit thinking blocks in message_delta-like payloads.
+  if (obj && obj.delta && obj.delta.type === 'thinking' && typeof obj.delta.signature === 'string' && obj.delta.signature !== '') {
+    obj.delta.signature = '';
+    changed = true;
+  }
+
+  if (!changed) return line;
+  return 'data: ' + JSON.stringify(obj);
+}
+
+function createSseRewriter(targetIsDeepseek) {
+  let buffer = '';
+  return {
+    push(chunk) {
+      buffer += chunk.toString('utf8');
+      const out = [];
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const eventBlock = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const lines = eventBlock.split('\n').map(line => rewriteSseDataLine(line, targetIsDeepseek));
+        out.push(lines.join('\n') + '\n\n');
+      }
+      return out;
+    },
+    flush() {
+      if (!buffer) return '';
+      const lines = buffer.split('\n').map(line => rewriteSseDataLine(line, targetIsDeepseek));
+      buffer = '';
+      return lines.join('\n');
+    }
+  };
 }
 
 // L2: crash guard — catch unhandled errors, log them, then exit so watchdog restarts.
@@ -280,6 +354,19 @@ function watcherTick() {
     //     persistence. If cc-switch swaps a slot's _MODEL_NAME, the next
     //     tick reflects it within WATCH_INTERVAL_MS.
     const newAlias = buildAliasMapFromSettings(settings);
+
+    // Discover third-party model candidates for future generalized fixes.
+    candidateTargets.clear();
+    for (const real of newAlias.values()) {
+      const m = stripBracketSuffix(real);
+      if (!m) continue;
+      const lower = m.toLowerCase();
+      if (lower.startsWith('deepseek')) continue;
+      if (lower.startsWith('claude')) continue;
+      if (lower.startsWith('gpt-')) continue;
+      candidateTargets.add(m);
+    }
+
     const aliasChanged = (newAlias.size !== aliasMap.size) ||
       [...newAlias].some(([k, v]) => aliasMap.get(k) !== v);
     if (aliasChanged) {
@@ -344,6 +431,7 @@ const server = http.createServer((req, res) => {
       uptime:    Math.floor((Date.now() - START_TIME) / 1000),
       upstream:  CURRENT_UPSTREAM,
       targets:   TARGET_MODELS,
+      candidateTargets: Array.from(candidateTargets),
       aliasMap:  Object.fromEntries(aliasMap),
       stats
     }, null, 2);
@@ -375,6 +463,7 @@ const server = http.createServer((req, res) => {
     const pathOnly = req.url.split('?')[0];
     const isMessages = req.method === 'POST' && pathOnly.endsWith('/v1/messages');
     let note = 'passthrough';
+    let responseTargetIsDeepseek = false;
 
     if (isMessages && bodyBuf.length) {
       try {
@@ -383,6 +472,7 @@ const server = http.createServer((req, res) => {
         const real  = resolveRealModel(label);
         const rewroteModel = (real !== label);
         const targetIsDeepseek = isDeepseek(real);
+        responseTargetIsDeepseek = targetIsDeepseek;
 
         // Rewrite body.model to the real model name so upstream actually
         // calls the model the user configured in _MODEL_NAME.
@@ -439,8 +529,75 @@ const server = http.createServer((req, res) => {
         headers
       },
       upRes => {
-        res.writeHead(upRes.statusCode, upRes.headers);
-        upRes.pipe(res);
+        clearTimeout(upTimer); // upstream responded — cancel pre-response timeout
+        const contentType = String(upRes.headers['content-type'] || '');
+        const isSse = /text\/event-stream/i.test(contentType);
+
+        if (!isSse) {
+          // Non-streaming: buffer full response, rewrite thinking signatures if needed.
+          if (!responseTargetIsDeepseek) {
+            res.writeHead(upRes.statusCode, upRes.headers);
+            upRes.pipe(res);
+            return;
+          }
+          const respChunks = [];
+          upRes.on('data', c => respChunks.push(c));
+          upRes.on('end', () => {
+            const respBuf = Buffer.concat(respChunks);
+            let finalBuf = respBuf;
+            try {
+              const respBody = JSON.parse(respBuf.toString('utf8'));
+              const n = rewriteJsonThinkingSignatures(respBody);
+              if (n > 0) {
+                finalBuf = Buffer.from(JSON.stringify(respBody), 'utf8');
+                stats.sseRewritten += n;
+                log(`RESPONSE: cleared ${n} thinking signature(s) [non-stream]`);
+              }
+            } catch (_) { /* not JSON or no thinking blocks — fine */ }
+            const outHeaders = Object.assign({}, upRes.headers);
+            if (finalBuf !== respBuf) {
+              outHeaders['content-length'] = String(finalBuf.length);
+            }
+            res.writeHead(upRes.statusCode, outHeaders);
+            res.end(finalBuf);
+          });
+          upRes.on('error', err => {
+            log(`UPSTREAM RESP ERROR: ${err.message}`);
+            if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: err.message } }));
+          });
+          return;
+        }
+
+        // SSE response-side signature normalization for deepseek-family models.
+        const outHeaders = Object.assign({}, upRes.headers);
+        delete outHeaders['content-length'];
+        outHeaders['transfer-encoding'] = 'chunked';
+        res.writeHead(upRes.statusCode, outHeaders);
+
+        const rewriter = createSseRewriter(true);
+        upRes.on('data', chunk => {
+          for (const part of rewriter.push(chunk)) {
+            res.write(part, 'utf8');
+          }
+        });
+        upRes.on('end', () => {
+          const tail = rewriter.flush();
+          if (tail) res.write(tail, 'utf8');
+          res.end();
+        });
+        upRes.on('error', err => {
+          log(`UPSTREAM SSE ERROR (${UP_IS_TLS ? 'https' : 'http'}://${UP.hostname}:${UP_PORT}): ${err.message}`);
+          if (!res.headersSent) {
+            res.writeHead(502, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({
+              type: 'error',
+              error: { type: 'proxy_error', message: `shim upstream sse error: ${err.message}` }
+            }));
+          } else {
+            res.end();
+          }
+        });
       }
     );
     upReq.on('error', err => {
@@ -452,9 +609,12 @@ const server = http.createServer((req, res) => {
       }));
     });
 
-    // Upstream timeout guard — prevents hanging connections from leaking resources.
-    const UP_TIMEOUT = parseInt(process.env.SHIM_UPSTREAM_TIMEOUT || '120000', 10);
-    upReq.setTimeout(UP_TIMEOUT, () => {
+    // Upstream timeout guard — only applies until first response byte arrives.
+    // Default 5 min. Thinking/reasoning requests can legitimately take minutes.
+    // Once upRes fires (stream begins), the timer is cleared so a long SSE
+    // stream is never cut off mid-flight by the pre-response timeout.
+    const UP_TIMEOUT = parseInt(process.env.SHIM_UPSTREAM_TIMEOUT || '300000', 10);
+    const upTimer = setTimeout(() => {
       upReq.destroy();
       if (!res.headersSent) {
         res.writeHead(504, { 'content-type': 'application/json' });
@@ -464,7 +624,7 @@ const server = http.createServer((req, res) => {
         }));
       }
       log(`UPSTREAM TIMEOUT after ${UP_TIMEOUT}ms -> ${CURRENT_UPSTREAM}`);
-    });
+    }, UP_TIMEOUT);
 
     upReq.end(bodyBuf);
   });
