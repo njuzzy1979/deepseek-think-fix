@@ -281,7 +281,10 @@ function rewriteSseDataLine(line, targetIsDeepseek) {
     }
   }
 
-  if (obj && obj.delta && obj.delta.type === 'thinking' && typeof obj.delta.signature === 'string' && obj.delta.signature !== '') {
+  if (obj && obj.delta && obj.delta.type === 'signature_delta' && typeof obj.delta.signature === 'string' && obj.delta.signature !== '') {
+    obj.delta.signature = '';
+    changed++;
+  } else if (obj && obj.delta && obj.delta.type === 'thinking' && typeof obj.delta.signature === 'string' && obj.delta.signature !== '') {
     obj.delta.signature = '';
     changed++;
   }
