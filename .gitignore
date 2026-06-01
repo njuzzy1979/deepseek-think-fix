@@ -1,0 +1,13 @@
+# Generated at startup — do not commit.
+.watchdog.cmd
+.shim-pid.txt
+.run-shim.cmd
+
+# Backup directory (personal intermediate files)
+backups/
+
+# Node
+node_modules/
+
+# Runtime logs (keep README.md, that's docs)
+shim.log
