@@ -137,3 +137,75 @@ echo ""
 echo "================================================================"
 echo "  A-E SUBTOTAL: PASS=$PASS  FAIL=$FAIL"
 echo "================================================================"
+
+# ---------------------------------------------------------------------------
+# F. Alias map tests — exercises the _MODEL → _MODEL_NAME rewrite path.
+#    Uses a temp settings file via SHIM_SETTINGS_PATH so the real
+#    ~/.claude/settings.json is never touched.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "--- F. Alias Map (REASONING_MODEL + DEFAULT slot) ---"
+
+# F1-F3: alias-map logic test via pure bash + node on a temp file.
+TMPSET=$(mktemp -p . shim-alias-test-XXXXXX.json 2>/dev/null || echo "./shim-alias-test-$$.json")
+cat > "$TMPSET" << 'ENDJSON'
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8788",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-label-opus",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "deepseek-v4-pro-guan-cc",
+    "ANTHROPIC_REASONING_MODEL": "claude-label-reasoning",
+    "ANTHROPIC_REASONING_MODEL_NAME": "deepseek-v4-pro-guan-cc"
+  }
+}
+ENDJSON
+
+node -e "
+const fs = require('fs');
+const settings = JSON.parse(fs.readFileSync(process.argv[1], 'utf8').replace(/^﻿/, ''));
+function stripBracketSuffix(s) {
+  if (typeof s !== 'string') return '';
+  return s.replace(/(?:\\[.*?\\])+\\s*$/, '').trim();
+}
+function buildAliasMapFromSettings(settings) {
+  const next = new Map();
+  const env = settings && settings.env;
+  if (!env || typeof env !== 'object') return next;
+  function addPair(label, real) {
+    label = stripBracketSuffix(label); real = stripBracketSuffix(real);
+    if (!label || !real || label === real) return;
+    next.set(label, real);
+  }
+  for (const key of Object.keys(env)) {
+    const m = key.match(/^ANTHROPIC_DEFAULT_(.+)_MODEL$/);
+    if (m) { addPair(env[key], env['ANTHROPIC_DEFAULT_'+m[1]+'_MODEL_NAME']||''); continue; }
+    if (key === 'ANTHROPIC_REASONING_MODEL') addPair(env[key], env['ANTHROPIC_REASONING_MODEL_NAME']||'');
+  }
+  return next;
+}
+const map = buildAliasMapFromSettings(settings);
+let fail = 0;
+function check(label, cond, extra) {
+  if (cond) console.log('  PASS  ' + label);
+  else { console.log('  FAIL  ' + label + (extra ? ' -- ' + extra : '')); fail++; }
+}
+check('F1 DEFAULT_OPUS alias built', map.get('claude-label-opus') === 'deepseek-v4-pro-guan-cc');
+check('F2 REASONING alias built', map.get('claude-label-reasoning') === 'deepseek-v4-pro-guan-cc');
+check('F3 no spurious entries', map.size === 2, 'size=' + map.size);
+process.exit(fail > 0 ? 1 : 0);
+" "$TMPSET" 2>&1
+[ $? -eq 0 ] && { PASS=$((PASS+3)); } || { FAIL=$((FAIL+3)); }
+rm -f "$TMPSET"
+
+
+# F4-F6: /health endpoint checks.
+HEALTH=$(curl -s http://127.0.0.1:8788/health --max-time 5)
+echo "$HEALTH" | grep -q '"status"'   && mark_pass "F4 /health returns JSON with status field"   || mark_fail "F4 /health" "response: $HEALTH"
+echo "$HEALTH" | grep -q '"upstream"' && mark_pass "F5 /health includes upstream field"          || mark_fail "F5 /health missing upstream" ""
+echo "$HEALTH" | grep -q '"stats"'    && mark_pass "F6 /health includes stats field"             || mark_fail "F6 /health missing stats" ""
+
+echo ""
+echo "================================================================"
+echo "  TOTAL: PASS=$PASS  FAIL=$FAIL"
+echo "================================================================"

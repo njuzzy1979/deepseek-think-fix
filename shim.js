@@ -142,7 +142,11 @@ function buildAliasMapFromSettings(settings) {
   return next;
 }
 
-const LOG_FILE = process.env.SHIM_LOG || path.join(__dirname, 'shim.log');
+const LOG_FILE  = process.env.SHIM_LOG || path.join(__dirname, 'shim.log');
+const START_TIME = Date.now();
+
+// Runtime counters — exposed via /health.
+const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0 };
 const VERBOSE  = process.env.SHIM_VERBOSE === '1';
 const DUMP     = process.env.SHIM_DUMP === '1';
 
@@ -333,6 +337,21 @@ function startSettingsWatcher() {
 }
 
 const server = http.createServer((req, res) => {
+  // /health — status endpoint for monitoring and debugging.
+  if (req.method === 'GET' && req.url.split('?')[0] === '/health') {
+    const body = JSON.stringify({
+      status:    'ok',
+      uptime:    Math.floor((Date.now() - START_TIME) / 1000),
+      upstream:  CURRENT_UPSTREAM,
+      targets:   TARGET_MODELS,
+      aliasMap:  Object.fromEntries(aliasMap),
+      stats
+    }, null, 2);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(body);
+    return;
+  }
+
   const chunks = [];
   let totalSize = 0;
   req.on('data', c => {
@@ -395,8 +414,13 @@ const server = http.createServer((req, res) => {
         }
       } catch (e) {
         note = `parse-error, forwarding original: ${e.message}`;
+        stats.errors++;
       }
     }
+    stats.total++;
+    if (note.startsWith('FIXED'))     stats.fixed++;
+    else if (note.startsWith('no-op')) stats.noop++;
+    else if (note.startsWith('untouched') || note === 'passthrough') stats.untouched++;
     log(`${req.method} ${pathOnly} -> ${note}`);
 
     const headers = Object.assign({}, req.headers);
