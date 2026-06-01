@@ -144,9 +144,10 @@ Write-Host "To stop: double-click stop-shim.cmd"
 if (-not $NoEdit) {
   if ($cfg.env.ANTHROPIC_BASE_URL -ne $shimUrl) {
     $cfg.env.ANTHROPIC_BASE_URL = $shimUrl
-    $json = $cfg | ConvertTo-Json -Depth 10
+    $json = $cfg | ConvertTo-Json -Depth 100
     $tmp = "$settings.tmp"
-    [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine)
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, $utf8Bom)
     Move-Item -Path $tmp -Destination $settings -Force
     Write-Host "Updated settings.json: ANTHROPIC_BASE_URL -> $shimUrl"
   } else {

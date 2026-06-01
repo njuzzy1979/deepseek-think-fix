@@ -85,7 +85,9 @@ let aliasMap = new Map();
 
 function stripBracketSuffix(s) {
   if (typeof s !== 'string') return '';
-  return s.replace(/\[.*?\]\s*$/, '').trim();
+  // Strip trailing bracket suffixes like [1M] or [128K]. Handles multiple
+  // suffixes (e.g. "deepseek-v4[1M][legacy]" → "deepseek-v4").
+  return s.replace(/(?:\[.*?\])+\s*$/, '').trim();
 }
 
 // Returns true if the model name (real, post-alias) is in the deepseek family.
@@ -106,17 +108,6 @@ function resolveRealModel(labelFromBody) {
   if (!labelFromBody) return labelFromBody;
   if (aliasMap.has(labelFromBody)) return aliasMap.get(labelFromBody);
   return labelFromBody;
-}
-
-// Returns true if either the body.model label OR its mapped real name is
-// in the deepseek family. Used as the trigger for thinking-block injection.
-function isTargetModel(labelFromBody) {
-  if (!labelFromBody) return false;
-  // Static path: body.model is itself deepseek-*.
-  if (isDeepseek(labelFromBody)) return true;
-  // Alias path: body.model is a label; its mapped real name is deepseek-*.
-  if (aliasMap.has(labelFromBody) && isDeepseek(aliasMap.get(labelFromBody))) return true;
-  return false;
 }
 
 // Build alias map from CC settings.json env. For every slot, map _MODEL value
@@ -142,7 +133,10 @@ const LOG_FILE = process.env.SHIM_LOG || path.join(__dirname, 'shim.log');
 const VERBOSE  = process.env.SHIM_VERBOSE === '1';
 const DUMP     = process.env.SHIM_DUMP === '1';
 
-// L3: log rotation — cap shim.log at ~10 MB. If over, rename with timestamp.
+// L3 data guard — cap request body at ~5 MB (configurable).
+const MAX_BODY_SIZE = parseInt(process.env.SHIM_MAX_BODY_SIZE || String(5 * 1024 * 1024), 10);
+
+// L4: log rotation — cap shim.log at ~10 MB. If over, rename with timestamp.
 try {
   const stat = fs.statSync(LOG_FILE);
   if (stat.size > 10 * 1024 * 1024) {
@@ -160,7 +154,7 @@ const PLACEHOLDER_THINKING = {
 
 function log(line) {
   const msg = `[${new Date().toISOString()}] ${line}\n`;
-  try { fs.appendFileSync(LOG_FILE, msg); } catch (_) {}
+  fs.appendFile(LOG_FILE, msg, () => {}); // fire-and-forget, non-blocking
   if (VERBOSE) process.stdout.write(msg);
 }
 
@@ -195,7 +189,9 @@ process.on('uncaughtException', err => {
   setTimeout(() => process.exit(1), 200);
 });
 process.on('unhandledRejection', (reason, _promise) => {
-  const msg = reason instanceof Error ? reason.message : String(reason);
+  const msg = reason instanceof Error
+    ? `${reason.message}\n${reason.stack || '(no stack)'}`
+    : String(reason);
   log(`FATAL unhandledRejection: ${msg}`);
   setTimeout(() => process.exit(1), 200);
 });
@@ -246,6 +242,7 @@ let watcherBusy = false;
 function watcherTick() {
   if (watcherBusy) return;
   watcherBusy = true;
+  const _tickStart = Date.now();
   try {
     if (!fs.existsSync(SETTINGS_PATH)) return;
     let raw = fs.readFileSync(SETTINGS_PATH, 'utf8');
@@ -298,6 +295,10 @@ function watcherTick() {
     log(`WATCHER: tick error: ${e.message}`);
   } finally {
     watcherBusy = false;
+    const _elapsed = Date.now() - _tickStart;
+    if (_elapsed > WATCH_INTERVAL_MS * 0.8) {
+      log(`WATCHER: slow tick ${_elapsed}ms (threshold ${WATCH_INTERVAL_MS}ms)`);
+    }
   }
 }
 
@@ -314,7 +315,22 @@ function startSettingsWatcher() {
 
 const server = http.createServer((req, res) => {
   const chunks = [];
-  req.on('data', c => chunks.push(c));
+  let totalSize = 0;
+  req.on('data', c => {
+    totalSize += c.length;
+    if (totalSize > MAX_BODY_SIZE) {
+      if (!res.headersSent) {
+        res.writeHead(413, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'payload_too_large', message: `request body exceeds ${MAX_BODY_SIZE} bytes` }
+        }));
+      }
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
   req.on('error', err => { log(`CLIENT ERROR: ${err.message}`); try { res.destroy(); } catch (_) {} });
   req.on('end', () => {
     let bodyBuf = Buffer.concat(chunks);
@@ -392,6 +408,21 @@ const server = http.createServer((req, res) => {
         error: { type: 'proxy_error', message: `shim upstream error: ${err.message}` }
       }));
     });
+
+    // Upstream timeout guard — prevents hanging connections from leaking resources.
+    const UP_TIMEOUT = parseInt(process.env.SHIM_UPSTREAM_TIMEOUT || '120000', 10);
+    upReq.setTimeout(UP_TIMEOUT, () => {
+      upReq.destroy();
+      if (!res.headersSent) {
+        res.writeHead(504, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'upstream_timeout', message: `upstream did not respond within ${UP_TIMEOUT}ms` }
+        }));
+      }
+      log(`UPSTREAM TIMEOUT after ${UP_TIMEOUT}ms -> ${CURRENT_UPSTREAM}`);
+    });
+
     upReq.end(bodyBuf);
   });
 });

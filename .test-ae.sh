@@ -1,7 +1,7 @@
 #!/bin/bash
 set +e
 
-SHIMLOG=/e/Program/deepseek-think-fix/shim.log
+SHIMLOG="${SHIM_LOG:-$(dirname "$0")/shim.log}"
 PASS=0; FAIL=0
 
 mark_pass() { PASS=$((PASS+1)); echo "  PASS  $1"; }
