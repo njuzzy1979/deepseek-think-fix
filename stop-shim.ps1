@@ -97,9 +97,10 @@ if ((Test-Path $settings) -and (Test-Path $lastUpstreamFile)) {
   if ($cur -eq $shimUrl) {
     $orig = (Get-Content $lastUpstreamFile -Raw).Trim()
     $cfg.env.ANTHROPIC_BASE_URL = $orig
-    $json = $cfg | ConvertTo-Json -Depth 10
+    $json = $cfg | ConvertTo-Json -Depth 100
     $tmp = "$settings.tmp"
-    [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine)
+    $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+    [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, $utf8Bom)
     Move-Item -Path $tmp -Destination $settings -Force
     Write-Host "Restored ANTHROPIC_BASE_URL -> $orig"
   } else {
