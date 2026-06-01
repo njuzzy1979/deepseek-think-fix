@@ -249,7 +249,13 @@ function watcherTick() {
     if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
     let settings;
     try { settings = JSON.parse(raw); }
-    catch (e) { log(`WATCHER: settings.json parse error, skip: ${e.message}`); return; }
+    catch (_) {
+      // Tolerate trailing commas written by cc-switch (e.g. "value",\n  }).
+      // Strip commas immediately before ] or } and retry once.
+      const cleaned = raw.replace(/,(\s*[}\]])/g, '$1');
+      try { settings = JSON.parse(cleaned); }
+      catch (e) { log(`WATCHER: settings.json parse error, skip: ${e.message}`); return; }
+    }
     if (!settings || !settings.env) return;
 
     // (a) Refresh alias map from settings.json (source of truth).
