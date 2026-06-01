@@ -151,7 +151,7 @@ got=$(send_and_note '{"model":"deepseek","max_tokens":64,"messages":[{"role":"us
 got=$(send_and_note '{"model":"deepseek","max_tokens":64,"messages":[{"role":"user","content":"q"},{"role":"assistant","content":[{"type":"text","text":"reasoning"},{"type":"tool_use","id":"t1","name":"x","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}')
 [ "$got" = "FIXED" ] && mark_pass "E3 assistant has text+tool_use without thinking -> inject" || mark_fail "E3" "got $got"
 
-got=$(send_and_note '{"model":"deepseek","max_tokens":64,"messages":[{"role":"user","content":"q"},{"role":"assistant","content":[{"type":"redacted_thinking","data":"xxx"},{"type":"tool_use","id":"t1","name":"x","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}')
+got=$(send_and_note '{"model":"deepseek-e4-test","max_tokens":64,"messages":[{"role":"user","content":"q"},{"role":"assistant","content":[{"type":"redacted_thinking","data":"xxx"},{"type":"tool_use","id":"t1","name":"x","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}]}')
 [ "$got" = "no-op" ] && mark_pass "E4 redacted_thinking counts as thinking -> no-op" || mark_fail "E4" "got $got"
 
 echo ""
