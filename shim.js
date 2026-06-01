@@ -112,19 +112,32 @@ function resolveRealModel(labelFromBody) {
 
 // Build alias map from CC settings.json env. For every slot, map _MODEL value
 // (the label CC sends in body.model) → _MODEL_NAME value (the real model).
+// Handles both ANTHROPIC_DEFAULT_<SLOT>_MODEL/_MODEL_NAME pairs and the
+// ANTHROPIC_REASONING_MODEL/ANTHROPIC_REASONING_MODEL_NAME pair.
 function buildAliasMapFromSettings(settings) {
   const next = new Map();
   const env = settings && settings.env;
   if (!env || typeof env !== 'object') return next;
-  for (const key of Object.keys(env)) {
-    const m = key.match(/^ANTHROPIC_DEFAULT_(.+)_MODEL$/);
-    if (!m) continue;
-    const label = stripBracketSuffix(env[key]);
-    const realKey = `ANTHROPIC_DEFAULT_${m[1]}_MODEL_NAME`;
-    const real = stripBracketSuffix(env[realKey]);
-    if (!label || !real) continue;
-    if (label === real) continue; // identity mapping is meaningless
+
+  function addPair(label, real) {
+    label = stripBracketSuffix(label);
+    real  = stripBracketSuffix(real);
+    if (!label || !real) return;
+    if (label === real) return; // identity mapping is meaningless
     next.set(label, real);
+  }
+
+  for (const key of Object.keys(env)) {
+    // ANTHROPIC_DEFAULT_<SLOT>_MODEL → ANTHROPIC_DEFAULT_<SLOT>_MODEL_NAME
+    const m = key.match(/^ANTHROPIC_DEFAULT_(.+)_MODEL$/);
+    if (m) {
+      addPair(env[key], env[`ANTHROPIC_DEFAULT_${m[1]}_MODEL_NAME`] || '');
+      continue;
+    }
+    // ANTHROPIC_REASONING_MODEL → ANTHROPIC_REASONING_MODEL_NAME
+    if (key === 'ANTHROPIC_REASONING_MODEL') {
+      addPair(env[key], env['ANTHROPIC_REASONING_MODEL_NAME'] || '');
+    }
   }
   return next;
 }
@@ -154,7 +167,7 @@ const PLACEHOLDER_THINKING = {
 
 function log(line) {
   const msg = `[${new Date().toISOString()}] ${line}\n`;
-  fs.appendFile(LOG_FILE, msg, () => {}); // fire-and-forget, non-blocking
+  try { fs.appendFileSync(LOG_FILE, msg); } catch (_) {}
   if (VERBOSE) process.stdout.write(msg);
 }
 
