@@ -58,7 +58,7 @@ CC ──▶ shim :8788 (shim.js) ──▶ 上游 (cc-switch 代理 或 dmxapi.
               │    └─ deepseek-* 且缺 thinking 块 → 注入占位块
               ├─ 响应侧处理：
               │    ├─ 非流式 JSON：thinking signature 清零
-              │    └─ SSE 流：逐 event 改写 thinking signature
+              │    └─ SSE 流：逐 event 改写 thinking signature（content_block_start / signature_delta / delta）
               ├─ 每 3 秒轮询 settings.json：
               │    ├─ BASE_URL 自愈 + 别名映射刷新
               │    └─ trailing comma 容忍性解析
@@ -103,7 +103,7 @@ CC 的 `settings.json` 中有三类模型字段，搞错会导致静默路由错
 **响应侧**（上游返回时）：
 
 - 非流式 JSON：解析 `content` 数组，将 thinking 块的非空 signature 清零
-- SSE 流式：逐 event 解析，对 `content_block_start` 和 `delta` 中的 thinking signature 清零
+- SSE 流式：逐 event 解析，对 `content_block_start`、`signature_delta`、`delta(type=thinking)` 三种事件中的 thinking signature 清零
 - 目的：让 CC 保留 thinking 块内容（CC 丢弃非 Anthropic 签名的 thinking 块）
 
 ### Settings.json 监听器（自愈机制）

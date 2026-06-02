@@ -132,7 +132,7 @@ CC ──▶ shim :8788 (Node.js) ──▶ upstream (cc-switch 代理 或 dmxap
             │    └─ deepseek-* 且缺 thinking 块 → 注入占位块
             ├─ 响应侧：
             │    ├─ deepseek 非流式：解析 JSON，thinking signature 清零
-            │    └─ deepseek SSE 流：逐 event 改写 thinking signature
+            │    └─ deepseek SSE 流：逐 event 改写 thinking signature（content_block_start / signature_delta / delta）
             ├─ 每 3 秒轮询 settings.json：
             │    ├─ BASE_URL 被外部改写 → 自动热切换上游并写回
             │    ├─ trailing comma 容忍性解析
