@@ -164,7 +164,7 @@ const LOG_FILE  = process.env.SHIM_LOG || path.join(__dirname, 'shim.log');
 const START_TIME = Date.now();
 
 // Runtime counters — exposed via /health.
-const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0, sseRewritten: 0, trailingToolUseFixed: 0 };
+const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0, sseRewritten: 0, trailingToolUseFixed: 0, imagesStripped: 0 };
 
 // Candidate third-party models discovered from settings.json. Observability only
 // for now — does not change injection behavior automatically.
@@ -276,6 +276,39 @@ function fixTrailingAssistantToolUse(body) {
   last.content = last.content.filter(b => b && b.type !== 'tool_use');
   if (last.content.length === 0) last.content.push(Object.assign({}, PLACEHOLDER_THINKING));
   return true;
+}
+
+// Fix for "unknown variant image_url" 400 — CC may include Anthropic-format
+// image content blocks ({"type":"image","source":{"type":"base64",…}}) in the
+// conversation history (e.g. screenshots from the UI, or image-bearing
+// tool_result payloads). DeepSeek models do not support multimodal input,
+// and DMX fails to convert these blocks to its internal format, producing:
+//   "Failed to deserialize … messages[N]: unknown variant image_url, expected text"
+//
+// The fix strips image blocks and replaces them with a compact text note so
+// CC can still see that an image was present.
+function fixImageBlocks(body) {
+  if (!body || !Array.isArray(body.messages)) return 0;
+  let stripped = 0;
+  for (const msg of body.messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    const keep = [];
+    for (const block of msg.content) {
+      if (!block || block.type !== 'image') { keep.push(block); continue; }
+      const mt = (block.source && block.source.media_type) || 'image';
+      const dims = [];
+      if (block.source && block.source.type === 'base64' && block.source.data) {
+        dims.push('base64');
+        dims.push(`${Math.round(block.source.data.length / 1024)}KiB`);
+      }
+      const note = dims.length ? `[image: ${mt}, ${dims.join(', ')}]`
+                               : `[image: ${mt}]`;
+      keep.push({ type: 'text', text: note });
+      stripped++;
+    }
+    msg.content = keep;
+  }
+  return stripped;
 }
 
 // Streaming response-side fix: normalize non-Anthropic thinking signatures so
@@ -561,15 +594,23 @@ const server = http.createServer((req, res) => {
           if (DUMP) log(`  msgs ${real}: ${summarize(body)}`);
           const n = fixThinkingRoundtrip(body);
           const trimmedTrailingToolUse = fixTrailingAssistantToolUse(body);
+          const strippedImages = fixImageBlocks(body);
           const rewriteSuffix = rewroteModel ? ` (rewrote ${label} -> ${real})` : '';
-          if (n > 0 || trimmedTrailingToolUse || rewroteModel) {
+          if (n > 0 || trimmedTrailingToolUse || strippedImages || rewroteModel) {
             bodyBuf = Buffer.from(JSON.stringify(body), 'utf8');
           }
+          if (strippedImages > 0) stats.imagesStripped += strippedImages;
           if (trimmedTrailingToolUse) {
             stats.trailingToolUseFixed++;
-            note = `FIXED: injected ${n} thinking block(s) + dropped trailing unfinished tool_use [model=${real}]${rewriteSuffix}`;
+            let baseNote = `FIXED: injected ${n} thinking block(s) + dropped trailing unfinished tool_use`;
+            if (strippedImages > 0) baseNote += ` + stripped ${strippedImages} image(s)`;
+            note = `${baseNote} [model=${real}]${rewriteSuffix}`;
           } else if (n > 0) {
-            note = `FIXED: injected ${n} thinking block(s) [model=${real}]${rewriteSuffix}`;
+            let baseNote = `FIXED: injected ${n} thinking block(s)`;
+            if (strippedImages > 0) baseNote += ` + stripped ${strippedImages} image(s)`;
+            note = `${baseNote} [model=${real}]${rewriteSuffix}`;
+          } else if (strippedImages > 0) {
+            note = `FIXED: stripped ${strippedImages} image(s) [model=${real}]${rewriteSuffix}`;
           } else {
             note = `no-op [model=${real}]${rewriteSuffix}`;
           }
