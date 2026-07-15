@@ -11,3 +11,6 @@ node_modules/
 
 # Runtime logs (keep README.md, that's docs)
 shim.log
+
+# Error diagnostics — full request/response bodies, may contain conversation content
+error-dumps/

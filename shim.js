@@ -164,7 +164,7 @@ const LOG_FILE  = process.env.SHIM_LOG || path.join(__dirname, 'shim.log');
 const START_TIME = Date.now();
 
 // Runtime counters — exposed via /health.
-const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0, sseRewritten: 0 };
+const stats = { total: 0, fixed: 0, noop: 0, untouched: 0, errors: 0, sseRewritten: 0, trailingToolUseFixed: 0 };
 
 // Candidate third-party models discovered from settings.json. Observability only
 // for now — does not change injection behavior automatically.
@@ -184,6 +184,38 @@ try {
     fs.renameSync(LOG_FILE, rotated);
   }
 } catch (_) { /* file doesn't exist yet — fine */ }
+
+// Error diagnostics — on upstream 4xx/5xx, dump the exact request body we
+// sent (post-rewrite) and the exact response body we got, so a 400 like
+// "reasoning_content must be passed back" can be root-caused from real
+// traffic instead of guessed at via synthetic curl repros.
+// This is a local-only debugging aid (shim binds 127.0.0.1) — dumps may
+// contain full conversation content and the upstream error body.
+const ERROR_DUMP_DIR = process.env.SHIM_ERROR_DUMP_DIR || path.join(__dirname, 'error-dumps');
+const ERROR_DUMP_ENABLED = process.env.SHIM_ERROR_DUMP !== '0';
+
+function dumpErrorArtifact(statusCode, reqBodyBuf, respBodyBuf, extra) {
+  if (!ERROR_DUMP_ENABLED) return;
+  try {
+    if (!fs.existsSync(ERROR_DUMP_DIR)) fs.mkdirSync(ERROR_DUMP_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(ERROR_DUMP_DIR, `${ts}_${statusCode}.json`);
+    let reqBody = null;
+    try { reqBody = JSON.parse(reqBodyBuf.toString('utf8')); } catch (_) { reqBody = reqBodyBuf.toString('utf8'); }
+    let respBody = null;
+    try { respBody = JSON.parse(respBodyBuf.toString('utf8')); } catch (_) { respBody = respBodyBuf.toString('utf8'); }
+    const artifact = Object.assign({
+      timestamp: new Date().toISOString(),
+      statusCode,
+      requestBody: reqBody,
+      responseBody: respBody
+    }, extra || {});
+    fs.writeFileSync(file, JSON.stringify(artifact, null, 2), 'utf8');
+    log(`ERROR DUMP: wrote ${file}`);
+  } catch (e) {
+    log(`ERROR DUMP: failed to write artifact: ${e.message}`);
+  }
+}
 
 const PLACEHOLDER_THINKING = {
   type: 'thinking',
@@ -220,6 +252,30 @@ function fixThinkingRoundtrip(body) {
     injected++;
   }
   return injected;
+}
+
+// Fix for the "reasoning_content must be passed back" 400 — distinct from the
+// tool_use-roundtrip fix above. Triggered when CC's max_tokens cutoff lands
+// mid tool_use (the assistant reply was still emitting a tool call's JSON
+// input when generation stopped) and CC resends that unfinished assistant
+// message as the LAST message to continue generation. DMX rejects any
+// request ending in an assistant message that contains a tool_use block
+// with this error — it wants DeepSeek's native reasoning_content to resume
+// the reasoning chain, which Anthropic-format requests cannot supply.
+// There's no way to fabricate reasoning_content from an Anthropic-shaped
+// request, so the fix is to drop the unfinished tool_use block(s) from the
+// trailing assistant message entirely. DMX then treats it as a fresh
+// generation request and the model decides again whether/what to call —
+// the half-formed tool call is lost, but that beats a hard 400 stalling
+// the whole turn.
+function fixTrailingAssistantToolUse(body) {
+  if (!body || !Array.isArray(body.messages) || !body.messages.length) return false;
+  const last = body.messages[body.messages.length - 1];
+  if (!last || last.role !== 'assistant' || !Array.isArray(last.content)) return false;
+  if (!last.content.some(b => b && b.type === 'tool_use')) return false;
+  last.content = last.content.filter(b => b && b.type !== 'tool_use');
+  if (last.content.length === 0) last.content.push(Object.assign({}, PLACEHOLDER_THINKING));
+  return true;
 }
 
 // Streaming response-side fix: normalize non-Anthropic thinking signatures so
@@ -483,12 +539,14 @@ const server = http.createServer((req, res) => {
     const isMessages = req.method === 'POST' && pathOnly.endsWith('/v1/messages');
     let note = 'passthrough';
     let responseTargetIsDeepseek = false;
+    let requestModelLabel = '';
 
     if (isMessages && bodyBuf.length) {
       try {
         const body = JSON.parse(bodyBuf.toString('utf8'));
         const label = body.model || '';
         const real  = resolveRealModel(label);
+        requestModelLabel = real || label;
         const rewroteModel = (real !== label);
         const targetIsDeepseek = isDeepseek(real);
         responseTargetIsDeepseek = targetIsDeepseek;
@@ -502,11 +560,15 @@ const server = http.createServer((req, res) => {
         if (targetIsDeepseek) {
           if (DUMP) log(`  msgs ${real}: ${summarize(body)}`);
           const n = fixThinkingRoundtrip(body);
+          const trimmedTrailingToolUse = fixTrailingAssistantToolUse(body);
           const rewriteSuffix = rewroteModel ? ` (rewrote ${label} -> ${real})` : '';
-          if (n > 0 || rewroteModel) {
+          if (n > 0 || trimmedTrailingToolUse || rewroteModel) {
             bodyBuf = Buffer.from(JSON.stringify(body), 'utf8');
           }
-          if (n > 0) {
+          if (trimmedTrailingToolUse) {
+            stats.trailingToolUseFixed++;
+            note = `FIXED: injected ${n} thinking block(s) + dropped trailing unfinished tool_use [model=${real}]${rewriteSuffix}`;
+          } else if (n > 0) {
             note = `FIXED: injected ${n} thinking block(s) [model=${real}]${rewriteSuffix}`;
           } else {
             note = `no-op [model=${real}]${rewriteSuffix}`;
@@ -555,6 +617,17 @@ const server = http.createServer((req, res) => {
         if (!isSse) {
           // Non-streaming: buffer full response, rewrite thinking signatures if needed.
           if (!responseTargetIsDeepseek) {
+            if (upRes.statusCode >= 400) {
+              const respChunks = [];
+              upRes.on('data', c => respChunks.push(c));
+              upRes.on('end', () => {
+                const respBuf = Buffer.concat(respChunks);
+                dumpErrorArtifact(upRes.statusCode, bodyBuf, respBuf, { stream: false, model: requestModelLabel });
+                res.writeHead(upRes.statusCode, upRes.headers);
+                res.end(respBuf);
+              });
+              return;
+            }
             res.writeHead(upRes.statusCode, upRes.headers);
             upRes.pipe(res);
             return;
@@ -564,6 +637,9 @@ const server = http.createServer((req, res) => {
           upRes.on('end', () => {
             const respBuf = Buffer.concat(respChunks);
             let finalBuf = respBuf;
+            if (upRes.statusCode >= 400) {
+              dumpErrorArtifact(upRes.statusCode, bodyBuf, respBuf, { stream: false, model: requestModelLabel });
+            }
             try {
               const respBody = JSON.parse(respBuf.toString('utf8'));
               const n = rewriteJsonThinkingSignatures(respBody);
@@ -595,7 +671,10 @@ const server = http.createServer((req, res) => {
         res.writeHead(upRes.statusCode, outHeaders);
 
         const rewriter = createSseRewriter(true);
+        const isErrorStatus = upRes.statusCode >= 400;
+        const rawChunksForDump = isErrorStatus ? [] : null;
         upRes.on('data', chunk => {
+          if (isErrorStatus) rawChunksForDump.push(chunk);
           for (const part of rewriter.push(chunk)) {
             res.write(part, 'utf8');
           }
@@ -607,6 +686,9 @@ const server = http.createServer((req, res) => {
           if (n > 0) {
             stats.sseRewritten += n;
             log(`RESPONSE: cleared ${n} thinking signature(s) [stream]`);
+          }
+          if (isErrorStatus) {
+            dumpErrorArtifact(upRes.statusCode, bodyBuf, Buffer.concat(rawChunksForDump), { stream: true, model: requestModelLabel });
           }
           res.end();
         });
