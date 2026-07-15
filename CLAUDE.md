@@ -4,12 +4,13 @@
 
 ## 概述
 
-本地反向代理 shim（Node.js，零依赖），修复 Claude Code 在 thinking 模式下通过 API 聚合商（DMX 等）调用 DeepSeek 等第三方模型时的两种 400 错误：
+本地反向代理 shim（Node.js，零依赖），修复 Claude Code 在 thinking 模式下通过 API 聚合商（DMX 等）调用 DeepSeek 等第三方模型时的三种 400 错误：
 
 | 错误信息 | 触发条件 | 修复方式 |
 | --- | --- | --- |
 | `The content[].thinking … must be passed back` | assistant 含 tool_use 但无 thinking 块 | 注入占位 thinking 块 |
 | `The reasoning_content … must be passed back` | 请求**结尾**的 assistant 含 tool_use（CC 的 max_tokens 续写请求） | 剥离未完成 tool_use |
+| `unknown variant image_url, expected text` | 消息含 Anthropic 原生 `image` 内容块（截图等） | 剥离 image 块，替换为文本占位 |
 
 详细根因和排查过程见[修复全记录.md](修复全记录.md)。
 
@@ -66,7 +67,8 @@ CC ──▶ shim :8788 (shim.js) ──▶ 上游 (cc-switch 代理 或 dmxapi.
               │    ├─ 查静态改写规则（SHIM_MODEL_REWRITE_RULES）
               │    ├─ 改写 body.model 从 CC 标签到真实模型名
               │    ├─ 修复一：assistant 缺 thinking 块 → 注入占位块
-              │    └─ 修复二：结尾 assistant + 含 tool_use → 剥离未完成 tool_use
+              │    ├─ 修复二：结尾 assistant + 含 tool_use → 剥离未完成 tool_use
+              │    └─ 修复三：消息含 image 块（截图） → 剥离并替换为文本占位
               ├─ 响应侧处理：
               │    ├─ 非流式 JSON：thinking signature 清零
               │    └─ SSE 流：逐 event 改写 thinking signature（content_block_start / signature_delta / delta）
@@ -128,6 +130,12 @@ CC 的 `settings.json` 中有三类模型字段，搞错会导致静默路由错
 - 两代修复互不冲突：一次请求可能先注入占位 thinking（修复一），再剥离结尾 tool_use（修复二）
 - 代价：被截断的半成品工具调用会丢失，模型需要重新生成——但避免了 400 硬错误卡死任务
 
+**修复三：`image_url` 解析错误**（`fixImageBlocks`，2026-07-16 新增）
+
+- CC 在工具调用结果中可能混入 Anthropic 原生的 `image` 内容块（含 base64 PNG/JPG 截图），DeepSeek 不支持多模态输入，DMX 在序列化阶段报 `unknown variant image_url` 错误
+- 修复：遍历所有消息，将 `type: image` 的内容块替换为紧凑的文本占位 `[image: media_type, base64, NKiB]`，保留上下文提示而不触发上游解析错误
+- 不影响 CC 的其他文本/tool 内容块，不影响非 deepseek 请求
+
 ### Settings.json 监听器（自愈机制）
 
 cc-switch 会持续重写 `ANTHROPIC_BASE_URL`。监听器每 3 秒：
@@ -164,7 +172,8 @@ cc-switch 会持续重写 `ANTHROPIC_BASE_URL`。监听器每 3 秒：
     "untouched": 46,
     "errors": 0,
     "sseRewritten": 12,
-    "trailingToolUseFixed": 3
+    "trailingToolUseFixed": 3,
+    "imagesStripped": 1
   }
 }
 ```
@@ -191,4 +200,4 @@ $env:SHIM_MODEL_REWRITE_RULES = "claude-sonnet-4-6:claude-sonnet-4-6-cc"
 4. **超时计时器在首字节到达后取消**：避免 thinking 长推理被 120s 超时截断（已改为 300s，且 SSE 流开始后不受限）。
 5. **`url.parse` 而非 WHATWG URL**：有意使用旧版 API 以最小化代码复杂度。Node 25 的 DEP0169 警告无害。
 6. **`SHIM_MODEL_REWRITE_RULES` 优先级最高**：解决 CC 内部硬编码模型名绕过 settings.json 别名映射的问题。
-7. **错误诊断落盘**：上游 4xx/5xx 时自动保存完整请求/响应体到 `error-dumps/`。第二代问题是纯靠 curl 构造请求复现不出来的——直到靠这个功能拿到真实流量抓包数据，才在几分钟内锁定根因。不能假设修复一次就一劳永逸，需要持续诊断能力跟踪上游校验规则变更。
+7. **错误诊断落盘**：上游 4xx/5xx 时自动保存完整请求/响应体到 `error-dumps/`。第二代问题是纯靠 curl 构造请求复现不出来的——直到靠这个功能拿到真实流量抓包数据，才在几分钟内锁定根因。第三代 image_url 问题同理，dump 到含 base64 图像的完整请求体后直接定位到 messages[126]。不能假设修复一次就一劳永逸，需要持续诊断能力跟踪上游校验规则变更。

@@ -1,11 +1,12 @@
 # deepseek-think-fix
 
-修复 Claude Code 通过 API 聚合商（DMX 等）调用 DeepSeek 等第三方模型时，在 thinking 模式下触发的两种 400 错误：
+修复 Claude Code 通过 API 聚合商（DMX 等）调用 DeepSeek 等第三方模型时，在 thinking 模式下触发的三种 400 错误：
 
 > **问题一**：`API Error: 400 The content[].thinking in the thinking mode must be passed back to the API.`
 > **问题二**：`API Error: 400 The reasoning_content in the thinking mode must be passed back to the API.`
+> **问题三**：`API Error: 400 unknown variant image_url, expected text`
 
-两种错误的字段名不同（`content[].thinking` vs `` `reasoning_content` ``），触发条件不同，需要不同修复策略。shim 同时覆盖两者。详细记录见[修复全记录.md](修复全记录.md)。
+三种错误的触发条件和修复方式各不相同。shim 同时覆盖三者。详细记录见[修复全记录.md](修复全记录.md)。
 
 ---
 
@@ -93,7 +94,8 @@ Get-NetTCPConnection -LocalPort 8788 -State Listen
     "untouched": 46,
     "errors": 0,
     "sseRewritten": 12,
-    "trailingToolUseFixed": 3
+    "trailingToolUseFixed": 3,
+    "imagesStripped": 1
   }
 }
 ```
@@ -109,6 +111,8 @@ Get-Content E:\Program\deepseek-think-fix\shim.log -Wait -Tail 5
 | `FIXED: injected N thinking block(s) [model=...]` | 请求侧注入占位块 |
 | `FIXED: injected N thinking block(s) [model=...] (rewrote label -> real)` | 别名改写 + 注入 |
 | `FIXED: injected N thinking block(s) + dropped trailing unfinished tool_use [model=...]` | 注入占位块 + 剥离结尾未完成 tool_use（问题二修复） |
+| `FIXED: stripped N image(s) [model=...]` | 剥离 image 内容块并替换为文本占位（问题三修复） |
+| `FIXED: injected N thinking block(s) + stripped M image(s) [model=...]` | 注入占位块 + 剥离 image 块（问题一+三同时命中） |
 | `RESPONSE: cleared N thinking signature(s) [stream]` | 响应侧 SSE signature 清零 |
 | `RESPONSE: cleared N thinking signature(s) [non-stream]` | 响应侧 JSON signature 清零 |
 | `ERROR DUMP: wrote error-dumps/...json` | 上游返回 4xx/5xx，完整请求/响应体已落盘 |
@@ -139,12 +143,13 @@ Get-Content E:\Program\deepseek-think-fix\shim.log -Wait -Tail 5
 ```text
 CC ──▶ shim :8788 (Node.js) ──▶ upstream (cc-switch 代理 或 dmxapi.cn 直连)
             │
-            ├─ 请求侧（两种并行修复）：
+            ├─ 请求侧（三种并行修复）：
             │    ├─ 读 settings.json 构建模型别名映射（三类字段）
             │    ├─ 查静态改写规则（SHIM_MODEL_REWRITE_RULES）
             │    ├─ 改写 body.model 从标签到真实模型名
             │    ├─ 修复一：assistant 缺 thinking 块 → 注入占位块
-            │    └─ 修复二：结尾 assistant + 含 tool_use → 剥离未完成 tool_use
+            │    ├─ 修复二：结尾 assistant + 含 tool_use → 剥离未完成 tool_use
+            │    └─ 修复三：消息含 image 块（截图）→ 剥离并替换为文本占位
             ├─ 响应侧：
             │    ├─ deepseek 非流式：解析 JSON，thinking signature 清零
             │    └─ deepseek SSE 流：逐 event 改写 thinking signature
@@ -205,6 +210,16 @@ curl -s https://www.dmxapi.cn/v1/messages \
     "tools":[{"name":"Bash","description":"run","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}]
   }'
 ```
+
+### 问题三：`image_url` 解析错误（第三代）
+
+**错误信息**：`Failed to deserialize the JSON body into the target type: messages[N]: unknown variant image_url, expected text`
+
+**触发条件**：请求消息中混入了 Anthropic 原生的 `image` 内容块（含 base64 编码的 PNG/JPG 截图）。CC 在工具调用结果中可能包含截图，DeepSeek 不支持多模态输入，DMX 在将其转换为内部格式时无法处理 `image` 块的 `source` 字段，反序列化失败报 `image_url` 解析错误。
+
+**修复**：遍历所有消息，将 `type: image` 的内容块替换为紧凑的文本占位 `[image: <media_type>, base64, <NKiB>]`，既保留上下文提示，又不触发上游解析错误。不影响其他内容块和非 deepseek 请求。
+
+**注意**：此问题只出现在某些 deepseek 模型变体（如 `deepseek-v4-pro-cc`），同一请求用 `deepseek-v4-pro-guan-cc` 可能正常通过——说明 DMX 对不同模型变体使用了不同的请求校验路径。如果你的 DMX 账户有多个 deepseek 变体可用，换用 `gcc` 后缀的变体可能是临时规避方案。
 
 ## 模型名语义与别名映射
 
