@@ -4,7 +4,14 @@
 
 ## 概述
 
-本地反向代理 shim（Node.js，零依赖），修复 Claude Code 在 thinking 模式下通过 API 聚合商（DMX 等）调用 DeepSeek 等第三方模型时的 400 错误。shim 位于 CC 与上游之间，同时在请求侧注入占位 thinking 块、在响应侧清零非标准 signature，双路修复 thinking 模式失败问题。
+本地反向代理 shim（Node.js，零依赖），修复 Claude Code 在 thinking 模式下通过 API 聚合商（DMX 等）调用 DeepSeek 等第三方模型时的两种 400 错误：
+
+| 错误信息 | 触发条件 | 修复方式 |
+| --- | --- | --- |
+| `The content[].thinking … must be passed back` | assistant 含 tool_use 但无 thinking 块 | 注入占位 thinking 块 |
+| `The reasoning_content … must be passed back` | 请求**结尾**的 assistant 含 tool_use（CC 的 max_tokens 续写请求） | 剥离未完成 tool_use |
+
+详细根因和排查过程见[修复全记录.md](修复全记录.md)。
 
 ## 命令
 
@@ -42,6 +49,9 @@ $env:SHIM_VERBOSE = "1"
 # 记录 assistant 消息块类型摘要
 $env:SHIM_DUMP = "1"
 
+# 关闭上游 4xx/5xx 请求体落盘（默认开启，落盘到 error-dumps/）
+$env:SHIM_ERROR_DUMP = "0"
+
 # 静态模型改写（解决 CC 内部硬编码模型名问题）
 $env:SHIM_MODEL_REWRITE_RULES = "claude-sonnet-4-6:claude-sonnet-4-6-cc"
 ```
@@ -55,13 +65,15 @@ CC ──▶ shim :8788 (shim.js) ──▶ 上游 (cc-switch 代理 或 dmxapi.
               │    ├─ 读 settings.json 构建三类别名映射
               │    ├─ 查静态改写规则（SHIM_MODEL_REWRITE_RULES）
               │    ├─ 改写 body.model 从 CC 标签到真实模型名
-              │    └─ deepseek-* 且缺 thinking 块 → 注入占位块
+              │    ├─ 修复一：assistant 缺 thinking 块 → 注入占位块
+              │    └─ 修复二：结尾 assistant + 含 tool_use → 剥离未完成 tool_use
               ├─ 响应侧处理：
               │    ├─ 非流式 JSON：thinking signature 清零
               │    └─ SSE 流：逐 event 改写 thinking signature（content_block_start / signature_delta / delta）
               ├─ 每 3 秒轮询 settings.json：
               │    ├─ BASE_URL 自愈 + 别名映射刷新
               │    └─ trailing comma 容忍性解析
+              ├─ 上游 4xx/5xx → 落盘完整请求/响应体到 error-dumps/
               ├─ GET /health → 返回运行状态 JSON
               └─ 崩溃 → watchdog 3 秒后重启
 ```
@@ -70,12 +82,13 @@ CC ──▶ shim :8788 (shim.js) ──▶ 上游 (cc-switch 代理 或 dmxapi.
 
 | 文件 | 职责 |
 | --- | --- |
-| `shim.js` | 核心代理（约 670 行，零依赖）。请求拦截、模型改写、thinking 注入、SSE signature 改写、settings 监听、/health 端点、统计计数、崩溃保护 |
+| `shim.js` | 核心代理（约 730 行，零依赖）。请求拦截、模型改写、thinking 注入、结尾 tool_use 剥离、SSE signature 改写、settings 监听、/health 端点、统计计数、崩溃保护 |
 | `start-shim.ps1` | 启动器：检测上游模式、每日备份 settings.json、生成 `.watchdog.cmd`、启动 watchdog、将 `ANTHROPIC_BASE_URL` 指向 shim |
 | `stop-shim.ps1` | 永久停止（不自动重启）：删除 PID 文件 → 杀进程树 → 清理孤儿进程 → 还原 `ANTHROPIC_BASE_URL` |
 | `.test-ae.sh` | 综合测试套件（bash + curl，A-F 组，49 项）。覆盖模型识别矩阵、边界条件、流式传输、消息形态变体、别名映射、/health 端点 |
 | `.test-alias.js` | 别名映射逻辑单元测试（纯 node，14 项）。测试三类字段对、identity 跳过、多后缀剥离 |
 | `.watchdog.cmd` | 自动生成的守护脚本。node 崩溃时重启；PID 文件被删除时干净退出 |
+| `error-dumps/` | 上游 4xx/5xx 时落盘的完整请求/响应体（本地调试用，已 gitignore） |
 
 ### 模型名语义（关键）
 
@@ -92,7 +105,9 @@ CC 的 `settings.json` 中有三类模型字段，搞错会导致静默路由错
 2. settings.json 别名映射（每 3 秒全量重建，无状态）
 3. 原始 label 值透传（identity）
 
-### Thinking 双路修复
+### Thinking 修复（两代问题并行覆盖）
+
+**修复一：`content[].thinking` 缺失**（第一代，`fixThinkingRoundtrip`）
 
 **请求侧**（每轮 multi-turn 请求时）：
 
@@ -105,6 +120,13 @@ CC 的 `settings.json` 中有三类模型字段，搞错会导致静默路由错
 - 非流式 JSON：解析 `content` 数组，将 thinking 块的非空 signature 清零
 - SSE 流式：逐 event 解析，对 `content_block_start`、`signature_delta`、`delta(type=thinking)` 三种事件中的 thinking signature 清零
 - 目的：让 CC 保留 thinking 块内容（CC 丢弃非 Anthropic 签名的 thinking 块）
+
+**修复二：`reasoning_content` 缺失**（第二代，`fixTrailingAssistantToolUse`，2026-07-16 新增）
+
+- 触发条件：请求消息数组的**最后一条**是 `assistant` 且含 `tool_use` 块（CC 因 `max_tokens` 截断发出的续写请求）
+- 修复：从结尾 assistant 消息中移除所有 `tool_use` 块（保留 thinking/text），让 DMX 当作正常生成请求处理
+- 两代修复互不冲突：一次请求可能先注入占位 thinking（修复一），再剥离结尾 tool_use（修复二）
+- 代价：被截断的半成品工具调用会丢失，模型需要重新生成——但避免了 400 硬错误卡死任务
 
 ### Settings.json 监听器（自愈机制）
 
@@ -141,7 +163,8 @@ cc-switch 会持续重写 `ANTHROPIC_BASE_URL`。监听器每 3 秒：
     "noop": 30,
     "untouched": 46,
     "errors": 0,
-    "sseRewritten": 12
+    "sseRewritten": 12,
+    "trailingToolUseFixed": 3
   }
 }
 ```
@@ -164,7 +187,8 @@ $env:SHIM_MODEL_REWRITE_RULES = "claude-sonnet-4-6:claude-sonnet-4-6-cc"
 
 1. **轮询而非 fs.watch**：Windows 上外部进程通过 tmp+rename 模式写入 settings.json，`fs.watch` 经常漏事件。3 秒轮询可靠且无感知。
 2. **无状态别名映射**：每次 watcher 轮询时从 settings.json 全量重建，以其为唯一数据源。不持久化到磁盘，避免过期映射导致路由错误。
-3. **双路修复**：请求侧注入解决"下一轮缺 thinking"的问题；响应侧清零 signature 解决"CC 丢弃 thinking 内容"的问题。两路缺一不可。
+3. **双修复并行覆盖**：`fixThinkingRoundtrip` 解决工具调用后下一轮缺 thinking 的 400；`fixTrailingAssistantToolUse` 解决续写请求中结尾含 tool_use 触发的 `reasoning_content` 400。两路逻辑独立，可能同时命中。
 4. **超时计时器在首字节到达后取消**：避免 thinking 长推理被 120s 超时截断（已改为 300s，且 SSE 流开始后不受限）。
 5. **`url.parse` 而非 WHATWG URL**：有意使用旧版 API 以最小化代码复杂度。Node 25 的 DEP0169 警告无害。
 6. **`SHIM_MODEL_REWRITE_RULES` 优先级最高**：解决 CC 内部硬编码模型名绕过 settings.json 别名映射的问题。
+7. **错误诊断落盘**：上游 4xx/5xx 时自动保存完整请求/响应体到 `error-dumps/`。第二代问题是纯靠 curl 构造请求复现不出来的——直到靠这个功能拿到真实流量抓包数据，才在几分钟内锁定根因。不能假设修复一次就一劳永逸，需要持续诊断能力跟踪上游校验规则变更。
